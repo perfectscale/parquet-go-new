@@ -784,23 +784,50 @@ func reconstructFuncOfMap(columnIndex uint16, node Node) (uint16, reconstructFun
 			}
 		}
 
-		// compatibility shim for spec-non-conformant writers The Apache Parquet
-		// spec — and Dremel §4.2 — require one (R, D, value-if-present) tuple per
-		// leaf per record; there are 3rd party writers elides level entries for nil
-		// child leaves under Optional Groups inside Maps, leaving sibling columns
-		// short. Without this guard, the inner `column[:1]` slice on cap=0 panics.
-		// We pad short columns up to n with null Values (def=0 → leaf assigns Go zero,
-		// which matches the writer's intent for the elided fields).
+		// Compatibility shim for spec-non-conformant writers.
+		//
+		// The Apache Parquet spec — and Dremel §4.2 — require one
+		// (R, D, value-if-present) tuple per leaf per record. Some third-party
+		// writers elide level entries for nil child leaves under Optional Groups
+		// inside Maps, leaving sibling columns short on one or more entry groups.
+		// Without this guard, the inner `column[:1]` slice on cap=0 panics.
+		//
+		// For each sibling column we count its entry groups using the same
+		// rep-boundary logic that produced n from columns[0]; any column short
+		// on groups gets one null Value appended per missing group at the Map's
+		// repetition depth (def=0 → leaf assigns Go zero, which matches the
+		// writer's intent for the elided fields). Counting groups rather than
+		// comparing raw lengths is required because a single entry can
+		// legitimately contribute multiple Values to a sibling leaf when the
+		// Map value contains nested Repeated structures (a nested Map, a List,
+		// etc.).
+		//
 		// No-op on conformant input (parquet-go/Arrow/Spark/DuckDB writers).
 		for j, col := range columns {
-			if len(col) < n {
-				padded := make([]Value, n)
+			if j == 0 {
+				// columns[0] defined n; by construction it has exactly n groups.
+				continue
+			}
+
+			groups := 0
+			for i := 0; i < len(col); {
+				i++
+				groups++
+
+				for i < len(col) && col[i].repetitionLevel > levels.repetitionDepth {
+					i++
+				}
+			}
+
+			if groups < n {
+				missing := n - groups
+				padded := make([]Value, len(col)+missing)
 				copy(padded, col)
-				for k := len(col); k < n; k++ {
+				for k := len(col); k < len(padded); k++ {
 					padded[k].repetitionLevel = levels.repetitionDepth
 				}
 				columns[j] = padded
-				values[j] = padded[0:0:n]
+				values[j] = padded[0:0:len(padded)]
 			}
 		}
 

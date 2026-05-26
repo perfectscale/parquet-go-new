@@ -602,6 +602,103 @@ func TestReconstructMapInInterface(t *testing.T) {
 	}
 }
 
+// TestReconstructMapShortSiblingColumn is a regression test for the
+// reconstructFuncOfMap padding shim. It simulates a writer that emitted fewer
+// level entries than columns[0] expects on a sibling leaf under a Map subtree,
+// and asserts that Reconstruct does not panic and assigns the Go zero value to
+// the under-supplied slots.
+func TestReconstructMapShortSiblingColumn(t *testing.T) {
+	type Entry struct {
+		A string
+		B string
+	}
+	type Outer struct {
+		M map[string]Entry
+	}
+
+	schema := parquet.SchemaOf(Outer{})
+
+	// Build a fully-populated row, then drop the last Value from the last leaf
+	// column to simulate writer elision.
+	full := schema.Deconstruct(nil, Outer{M: map[string]Entry{
+		"k1": {A: "a1", B: "b1"},
+		"k2": {A: "a2", B: "b2"},
+	}})
+
+	columns := columnsOf(full)
+	lastCol := len(columns) - 1
+	if len(columns[lastCol]) < 2 {
+		t.Fatalf("expected at least 2 values in last column, got %d", len(columns[lastCol]))
+	}
+	columns[lastCol] = columns[lastCol][:len(columns[lastCol])-1]
+
+	var short parquet.Row
+	for _, c := range columns {
+		short = append(short, c...)
+	}
+
+	var got Outer
+	if err := schema.Reconstruct(&got, short); err != nil {
+		t.Fatalf("Reconstruct after truncation returned error: %v", err)
+	}
+
+	if len(got.M) != 2 {
+		t.Fatalf("expected 2 map entries after reconstruction, got %d: %#v", len(got.M), got.M)
+	}
+}
+
+// TestReconstructMapShortSiblingColumnNestedRepeated covers the C1 case
+// where a single Map entry can legitimately contribute multiple Values to a
+// sibling leaf (here, a nested Map inside the value group). Counting entry
+// groups rather than comparing raw column lengths is what makes this case
+// safe.
+func TestReconstructMapShortSiblingColumnNestedRepeated(t *testing.T) {
+	type Entry struct {
+		Inner map[string]string
+	}
+	type Outer struct {
+		M map[string]Entry
+	}
+
+	schema := parquet.SchemaOf(Outer{})
+
+	// k1 has two inner entries, contributing two Values per inner leaf;
+	// k2 has zero inner entries — a spec-compliant writer emits one
+	// (R, D, null) placeholder per inner leaf for k2. We drop those
+	// placeholders to simulate a non-conformant writer that elides them.
+	full := schema.Deconstruct(nil, Outer{M: map[string]Entry{
+		"k1": {Inner: map[string]string{"x": "1", "y": "2"}},
+		"k2": {Inner: map[string]string{}},
+	}})
+
+	columns := columnsOf(full)
+
+	// Drop the trailing Value on each leaf whose total length exceeds the
+	// number of outer entries — that's the placeholder for k2's empty Inner.
+	const outerEntries = 2
+	for j, col := range columns {
+		if j == 0 {
+			continue
+		}
+		if len(col) > outerEntries && len(col) > 0 {
+			columns[j] = col[:len(col)-1]
+		}
+	}
+
+	var short parquet.Row
+	for _, c := range columns {
+		short = append(short, c...)
+	}
+
+	var got Outer
+	if err := schema.Reconstruct(&got, short); err != nil {
+		t.Fatalf("Reconstruct with nested-Repeated elision returned error: %v", err)
+	}
+	if len(got.M) != 2 {
+		t.Fatalf("expected 2 outer map entries, got %d: %#v", len(got.M), got.M)
+	}
+}
+
 func columnsOf(row parquet.Row) [][]parquet.Value {
 	columns := make([][]parquet.Value, 0)
 	row.Range(func(_ int, c []parquet.Value) bool {
