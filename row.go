@@ -784,53 +784,6 @@ func reconstructFuncOfMap(columnIndex uint16, node Node) (uint16, reconstructFun
 			}
 		}
 
-		// Compatibility shim for spec-non-conformant writers.
-		//
-		// The Apache Parquet spec — and Dremel §4.2 — require one
-		// (R, D, value-if-present) tuple per leaf per record. Some third-party
-		// writers elide level entries for nil child leaves under Optional Groups
-		// inside Maps, leaving sibling columns short on one or more entry groups.
-		// Without this guard, the inner `column[:1]` slice on cap=0 panics.
-		//
-		// For each sibling column we count its entry groups using the same
-		// rep-boundary logic that produced n from columns[0]; any column short
-		// on groups gets one null Value appended per missing group at the Map's
-		// repetition depth (def=0 → leaf assigns Go zero, which matches the
-		// writer's intent for the elided fields). Counting groups rather than
-		// comparing raw lengths is required because a single entry can
-		// legitimately contribute multiple Values to a sibling leaf when the
-		// Map value contains nested Repeated structures (a nested Map, a List,
-		// etc.).
-		//
-		// No-op on conformant input (parquet-go/Arrow/Spark/DuckDB writers).
-		for j, col := range columns {
-			if j == 0 {
-				// columns[0] defined n; by construction it has exactly n groups.
-				continue
-			}
-
-			groups := 0
-			for i := 0; i < len(col); {
-				i++
-				groups++
-
-				for i < len(col) && col[i].repetitionLevel > levels.repetitionDepth {
-					i++
-				}
-			}
-
-			if groups < n {
-				missing := n - groups
-				padded := make([]Value, len(col)+missing)
-				copy(padded, col)
-				for k := len(col); k < len(padded); k++ {
-					padded[k].repetitionLevel = levels.repetitionDepth
-				}
-				columns[j] = padded
-				values[j] = padded[0:0:len(padded)]
-			}
-		}
-
 		if value.IsNil() {
 			m := reflect.MakeMapWithSize(t, n)
 			value.Set(m)
@@ -845,6 +798,26 @@ func reconstructFuncOfMap(columnIndex uint16, node Node) (uint16, reconstructFun
 		for range n {
 			for j, column := range values {
 				column = column[:cap(column)]
+
+				// Compatibility shim for spec-non-conformant writers.
+				//
+				// The Apache Parquet spec — and Dremel §4.2 — require one
+				// (R, D, value-if-present) tuple per leaf per record. Some
+				// third-party writers elide level entries for nil child leaves
+				// under Optional Groups inside Maps, so a sibling column can
+				// run out of Values before all n entries have been consumed.
+				// When that happens, synthesise a null placeholder at the
+				// Map's repetition depth so the leaf reconstruct path assigns
+				// the Go zero value (def=0 → null), matching the writer's
+				// intent for the elided fields.
+				//
+				// No-op on conformant input — every leaf always has enough
+				// Values for n entries, so this branch never fires.
+				if cap(column) == 0 {
+					values[j] = []Value{{repetitionLevel: levels.repetitionDepth}}
+					continue
+				}
+
 				k := 1
 
 				for k < len(column) && column[k].repetitionLevel > levels.repetitionDepth {
